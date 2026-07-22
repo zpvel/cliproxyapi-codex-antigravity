@@ -1,0 +1,151 @@
+From eaf242517c1b1034d80d23326281801f029f4a59 Mon Sep 17 00:00:00 2001
+From: zpvel <56710676+zpvel@users.noreply.github.com>
+Date: Wed, 22 Jul 2026 22:13:46 +0800
+Subject: [PATCH] respect configured proxy for management model probes
+
+---
+ internal/api/handlers/management/api_tools.go | 41 +++++++++++++-
+ .../api/handlers/management/api_tools_test.go | 54 +++++++++++++++++++
+ 2 files changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/internal/api/handlers/management/api_tools.go b/internal/api/handlers/management/api_tools.go
+index e125192..60c5bb8 100644
+--- a/internal/api/handlers/management/api_tools.go
++++ b/internal/api/handlers/management/api_tools.go
+@@ -175,7 +175,7 @@ func (h *Handler) APICall(c *gin.Context) {
+ 	httpClient := &http.Client{
+ 		Timeout: defaultAPICallTimeout,
+ 	}
+-	httpClient.Transport = h.apiCallTransport(auth)
++	httpClient.Transport = h.apiCallTransportForURL(auth, urlStr)
+ 
+ 	resp, errDo := httpClient.Do(req)
+ 	if errDo != nil {
+@@ -470,6 +470,10 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
+ }
+ 
+ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
++	return h.apiCallTransportForURL(auth, "")
++}
++
++func (h *Handler) apiCallTransportForURL(auth *coreauth.Auth, targetURL string) http.RoundTripper {
+ 	var proxyCandidates []string
+ 	if auth != nil {
+ 		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
+@@ -481,6 +485,11 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
+ 			}
+ 		}
+ 	}
++	if auth == nil && h != nil && h.cfg != nil {
++		if proxyStr := strings.TrimSpace(proxyURLFromConfiguredTarget(h.cfg, targetURL)); proxyStr != "" {
++			proxyCandidates = append(proxyCandidates, proxyStr)
++		}
++	}
+ 	if h != nil && h.cfg != nil {
+ 		if proxyStr := strings.TrimSpace(h.cfg.ProxyURL); proxyStr != "" {
+ 			proxyCandidates = append(proxyCandidates, proxyStr)
+@@ -502,6 +511,36 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
+ 	return clone
+ }
+ 
++func proxyURLFromConfiguredTarget(cfg *config.Config, targetURL string) string {
++	if cfg == nil || strings.TrimSpace(targetURL) == "" {
++		return ""
++	}
++	for i := range cfg.CodexKey {
++		entry := &cfg.CodexKey[i]
++		if configuredBaseMatchesTarget(entry.BaseURL, targetURL) {
++			return strings.TrimSpace(entry.ProxyURL)
++		}
++	}
++	return ""
++}
++
++func configuredBaseMatchesTarget(baseURL, targetURL string) bool {
++	base, errBase := url.Parse(strings.TrimSpace(baseURL))
++	target, errTarget := url.Parse(strings.TrimSpace(targetURL))
++	if errBase != nil || errTarget != nil || base.Scheme == "" || base.Host == "" {
++		return false
++	}
++	if !strings.EqualFold(base.Scheme, target.Scheme) || !strings.EqualFold(base.Host, target.Host) {
++		return false
++	}
++	basePath := strings.TrimRight(base.EscapedPath(), "/")
++	targetPath := strings.TrimRight(target.EscapedPath(), "/")
++	if basePath == "" {
++		return true
++	}
++	return targetPath == basePath || strings.HasPrefix(targetPath, basePath+"/")
++}
++
+ type apiKeyConfigEntry interface {
+ 	GetAPIKey() string
+ 	GetBaseURL() string
+diff --git a/internal/api/handlers/management/api_tools_test.go b/internal/api/handlers/management/api_tools_test.go
+index ca1f313..9534380 100644
+--- a/internal/api/handlers/management/api_tools_test.go
++++ b/internal/api/handlers/management/api_tools_test.go
+@@ -58,6 +58,60 @@ func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
+ 	}
+ }
+ 
++func TestAPICallTransportConfiguredCodexTargetBypassesGlobalProxyWithoutAuthIndex(t *testing.T) {
++	t.Parallel()
++
++	h := &Handler{
++		cfg: &config.Config{
++			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
++			CodexKey: []config.CodexKey{{
++				BaseURL:  "http://192.168.1.55:3020/v1",
++				ProxyURL: "direct",
++			}},
++		},
++	}
++
++	transport := h.apiCallTransportForURL(nil, "http://192.168.1.55:3020/v1/models")
++	httpTransport, ok := transport.(*http.Transport)
++	if !ok {
++		t.Fatalf("transport type = %T, want *http.Transport", transport)
++	}
++	if httpTransport.Proxy != nil {
++		t.Fatal("expected configured Codex target to bypass global proxy")
++	}
++}
++
++func TestAPICallTransportUnconfiguredTargetUsesGlobalProxyWithoutAuthIndex(t *testing.T) {
++	t.Parallel()
++
++	h := &Handler{
++		cfg: &config.Config{
++			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
++			CodexKey: []config.CodexKey{{
++				BaseURL:  "http://192.168.1.55:3020/v1",
++				ProxyURL: "direct",
++			}},
++		},
++	}
++
++	transport := h.apiCallTransportForURL(nil, "https://api.example.com/v1/models")
++	httpTransport, ok := transport.(*http.Transport)
++	if !ok {
++		t.Fatalf("transport type = %T, want *http.Transport", transport)
++	}
++	req, errRequest := http.NewRequest(http.MethodGet, "https://api.example.com/v1/models", nil)
++	if errRequest != nil {
++		t.Fatalf("http.NewRequest returned error: %v", errRequest)
++	}
++	proxyURL, errProxy := httpTransport.Proxy(req)
++	if errProxy != nil {
++		t.Fatalf("httpTransport.Proxy returned error: %v", errProxy)
++	}
++	if proxyURL == nil || proxyURL.String() != "http://global-proxy.example.com:8080" {
++		t.Fatalf("proxy URL = %v, want global proxy", proxyURL)
++	}
++}
++
+ func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
+ 	t.Parallel()
+ 
+-- 
+2.53.0.windows.3
+

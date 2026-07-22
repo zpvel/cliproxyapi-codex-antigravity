@@ -14,7 +14,7 @@ The patch adds end-to-end support for:
 
 ## Images
 
-GitHub Actions publishes multi-architecture images for `linux/amd64` and `linux/arm64`:
+GitHub Actions publishes an x86-64 image for `linux/amd64`, matching the target NAS:
 
 ```text
 ghcr.io/zpvel/cliproxyapi-codex-antigravity:patched-latest

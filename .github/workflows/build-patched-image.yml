@@ -106,9 +106,6 @@ jobs:
           echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
           echo "build_date=$build_date" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -119,12 +116,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build and publish multi-architecture image
+      - name: Build and publish x86-64 image
         uses: docker/build-push-action@v6
         with:
           context: source
           file: source/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           provenance: mode=max
           sbom: true
@@ -157,5 +154,5 @@ jobs:
             echo "- Upstream: \`${UPSTREAM_REPOSITORY}@${UPSTREAM_REF}\`"
             echo "- Rolling tag: \`${IMAGE}:patched-latest\`"
             echo "- Immutable release tag: \`${IMAGE}:${VERSION}\`"
-            echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- Platform: \`linux/amd64\`"
           } >> "$GITHUB_STEP_SUMMARY"

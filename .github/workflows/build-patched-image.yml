@@ -1,0 +1,161 @@
+name: Build patched CLIProxyAPI image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-patched-image.yml"
+      - "patches/**"
+  schedule:
+    - cron: "17 19 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Optional upstream release tag, for example v7.2.94"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: patched-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: router-for-me/CLIProxyAPI
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out patch repository
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      - name: Resolve upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          ref="${REQUESTED_REF:-}"
+          if [ -z "$ref" ]; then
+            ref="$(
+              curl --fail --silent --show-error --location \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/latest" \
+                | jq --raw-output .tag_name
+            )"
+          fi
+          if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+            echo "Unable to resolve an upstream release tag" >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out upstream and apply patches
+        env:
+          UPSTREAM_REF: ${{ steps.upstream.outputs.ref }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$UPSTREAM_REF" \
+            "https://github.com/${UPSTREAM_REPOSITORY}.git" source
+          git -C source config user.name "CLIProxyAPI patch automation"
+          git -C source config user.email "actions@users.noreply.github.com"
+          for patch in "$GITHUB_WORKSPACE"/overlay/patches/*.patch; do
+            git -C source am "$patch"
+          done
+          echo "commit=$(git -C source rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache: true
+          cache-dependency-path: source/go.sum
+
+      - name: Run tests
+        working-directory: source
+        run: go test ./...
+
+      - name: Verify server build
+        working-directory: source
+        run: go build -buildvcs=false -o /tmp/cli-proxy-api-test ./cmd/server
+
+      - name: Set image metadata
+        id: image
+        env:
+          UPSTREAM_REF: ${{ steps.upstream.outputs.ref }}
+        run: |
+          set -euo pipefail
+          image_name="$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+          patch_digest="$(sha256sum overlay/patches/*.patch | sha256sum | cut -d ' ' -f 1 | cut -c 1-12)"
+          source_commit="$(git -C source rev-parse --short HEAD)"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "image_name=$image_name" >> "$GITHUB_OUTPUT"
+          echo "version=${UPSTREAM_REF}-patched" >> "$GITHUB_OUTPUT"
+          echo "patch_digest=$patch_digest" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "build_date=$build_date" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and publish multi-architecture image
+        uses: docker/build-push-action@v6
+        with:
+          context: source
+          file: source/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
+            COMMIT=${{ steps.image.outputs.source_commit }}
+            BUILD_DATE=${{ steps.image.outputs.build_date }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}
+            io.cliproxyapi.upstream.ref=${{ steps.upstream.outputs.ref }}
+            io.cliproxyapi.patch.digest=${{ steps.image.outputs.patch_digest }}
+          tags: |
+            ${{ steps.image.outputs.image_name }}:patched-latest
+            ${{ steps.image.outputs.image_name }}:${{ steps.image.outputs.version }}
+            ${{ steps.image.outputs.image_name }}:patch-${{ steps.image.outputs.patch_digest }}
+
+      - name: Write job summary
+        env:
+          IMAGE: ${{ steps.image.outputs.image_name }}
+          VERSION: ${{ steps.image.outputs.version }}
+          UPSTREAM_REF: ${{ steps.upstream.outputs.ref }}
+        run: |
+          {
+            echo "## Published patched CLIProxyAPI image"
+            echo
+            echo "- Upstream: \`${UPSTREAM_REPOSITORY}@${UPSTREAM_REF}\`"
+            echo "- Rolling tag: \`${IMAGE}:patched-latest\`"
+            echo "- Immutable release tag: \`${IMAGE}:${VERSION}\`"
+            echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"

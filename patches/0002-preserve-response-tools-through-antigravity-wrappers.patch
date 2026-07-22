@@ -1,0 +1,108 @@
+From 61402dba9b07471c12008046268ac0a3fb20dd59 Mon Sep 17 00:00:00 2001
+From: zpvel <56710676+zpvel@users.noreply.github.com>
+Date: Wed, 22 Jul 2026 14:42:19 +0800
+Subject: [PATCH 2/2] preserve response tools through antigravity wrappers
+
+---
+ .../antigravity_openai-responses_response.go  |  4 +-
+ ...igravity_openai-responses_response_test.go | 72 +++++++++++++++++++
+ 2 files changed, 74 insertions(+), 2 deletions(-)
+ create mode 100644 internal/translator/antigravity/openai/responses/antigravity_openai-responses_response_test.go
+
+diff --git a/internal/translator/antigravity/openai/responses/antigravity_openai-responses_response.go b/internal/translator/antigravity/openai/responses/antigravity_openai-responses_response.go
+index 32569504..a8c28cea 100644
+--- a/internal/translator/antigravity/openai/responses/antigravity_openai-responses_response.go
++++ b/internal/translator/antigravity/openai/responses/antigravity_openai-responses_response.go
+@@ -22,12 +22,12 @@ func ConvertAntigravityResponseToOpenAIResponsesNonStream(ctx context.Context, m
+ 	}
+ 
+ 	requestResult := gjson.GetBytes(originalRequestRawJSON, "request")
+-	if responseResult.Exists() {
++	if requestResult.Exists() {
+ 		originalRequestRawJSON = []byte(requestResult.Raw)
+ 	}
+ 
+ 	requestResult = gjson.GetBytes(requestRawJSON, "request")
+-	if responseResult.Exists() {
++	if requestResult.Exists() {
+ 		requestRawJSON = []byte(requestResult.Raw)
+ 	}
+ 
+diff --git a/internal/translator/antigravity/openai/responses/antigravity_openai-responses_response_test.go b/internal/translator/antigravity/openai/responses/antigravity_openai-responses_response_test.go
+new file mode 100644
+index 00000000..c1ce300c
+--- /dev/null
++++ b/internal/translator/antigravity/openai/responses/antigravity_openai-responses_response_test.go
+@@ -0,0 +1,72 @@
++package responses
++
++import (
++	"context"
++	"testing"
++
++	"github.com/tidwall/gjson"
++)
++
++func TestConvertAntigravityResponseToOpenAIResponsesNonStream_PreservesOriginalResponsesTools(t *testing.T) {
++	originalRequest := []byte(`{
++		"model":"claude-opus-4-6-thinking",
++		"input":[{"type":"additional_tools","tools":[
++			{"type":"custom","name":"apply_patch"},
++			{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"send_message"}]}
++		]}]
++	}`)
++	translatedRequest := []byte(`{"model":"claude-opus-4-6-thinking","request":{"contents":[],"tools":[{"functionDeclarations":[{"name":"apply_patch"},{"name":"collaboration__send_message"}]}]}}`)
++	upstreamResponse := []byte(`{"response":{"responseId":"req_antigravity_tools","candidates":[{"content":{"role":"model","parts":[
++		{"functionCall":{"name":"apply_patch","args":{"input":"patch text"},"id":"call_patch"}},
++		{"functionCall":{"name":"collaboration__send_message","args":{"target":"worker"},"id":"call_send"}}
++	]}}]}}`)
++
++	response := ConvertAntigravityResponseToOpenAIResponsesNonStream(
++		context.Background(),
++		"claude-opus-4-6-thinking",
++		originalRequest,
++		translatedRequest,
++		upstreamResponse,
++		nil,
++	)
++	result := gjson.ParseBytes(response)
++	if got := result.Get("output.0.type").String(); got != "custom_tool_call" {
++		t.Fatalf("output[0].type = %q, want custom_tool_call. Response: %s", got, response)
++	}
++	if got := result.Get("output.0.input").String(); got != "patch text" {
++		t.Fatalf("output[0].input = %q, want patch text", got)
++	}
++	if got := result.Get("output.0.call_id").String(); got != "call_patch" {
++		t.Fatalf("output[0].call_id = %q, want call_patch", got)
++	}
++	if got := result.Get("output.1.name").String(); got != "send_message" {
++		t.Fatalf("output[1].name = %q, want send_message", got)
++	}
++	if got := result.Get("output.1.namespace").String(); got != "collaboration" {
++		t.Fatalf("output[1].namespace = %q, want collaboration", got)
++	}
++	if got := result.Get("output.1.call_id").String(); got != "call_send" {
++		t.Fatalf("output[1].call_id = %q, want call_send", got)
++	}
++}
++
++func TestConvertAntigravityResponseToOpenAIResponsesNonStream_UnwrapsWrappedOriginalRequest(t *testing.T) {
++	originalRequest := []byte(`{"request":{"model":"gemini-3-flash-agent","input":[{"type":"additional_tools","tools":[{"type":"custom","name":"apply_patch"}]}]}}`)
++	upstreamResponse := []byte(`{"response":{"responseId":"req_wrapped","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"apply_patch","args":{"input":"wrapped patch"},"id":"call_wrapped"}}]}}]}}`)
++
++	response := ConvertAntigravityResponseToOpenAIResponsesNonStream(
++		context.Background(),
++		"gemini-3-flash-agent",
++		originalRequest,
++		nil,
++		upstreamResponse,
++		nil,
++	)
++	result := gjson.ParseBytes(response)
++	if got := result.Get("output.0.type").String(); got != "custom_tool_call" {
++		t.Fatalf("output[0].type = %q, want custom_tool_call. Response: %s", got, response)
++	}
++	if got := result.Get("output.0.input").String(); got != "wrapped patch" {
++		t.Fatalf("output[0].input = %q, want wrapped patch", got)
++	}
++}

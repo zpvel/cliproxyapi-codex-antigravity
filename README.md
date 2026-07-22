@@ -10,6 +10,7 @@ The patch adds end-to-end support for:
 - reversible namespace and long/colliding tool-name mappings;
 - streaming and non-streaming tool-call events;
 - upstream function-call IDs as Responses `call_id` values;
+- explicit `response.failed` events when an upstream model stops after reasoning without producing a message or tool call;
 - existing Gemini and Claude reasoning-signature behavior.
 
 ## Images

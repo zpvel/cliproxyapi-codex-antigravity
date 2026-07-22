@@ -1,0 +1,130 @@
+From 16d09a30d8480fa9fdd97b53656ec0b6bac9f123 Mon Sep 17 00:00:00 2001
+From: zpvel <56710676+zpvel@users.noreply.github.com>
+Date: Wed, 22 Jul 2026 19:01:14 +0800
+Subject: [PATCH] fail reasoning-only responses explicitly
+
+---
+ .../gemini_openai-responses_response.go       | 21 +++++++-
+ .../gemini_openai-responses_response_test.go  | 49 +++++++++++++++++++
+ 2 files changed, 68 insertions(+), 2 deletions(-)
+
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
+index a173be03..eaafd8b1 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_response.go
+@@ -478,8 +478,16 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
+ 
+ 		// Reasoning already finalized above if present
+ 
+-		// Build response.completed with aggregated outputs and request echo fields
++		// A reasoning-only terminal response gives Codex no message or tool call to
++		// act on. Report it as an upstream failure instead of silently completing
++		// the turn with last_agent_message=null.
++		hasActionableOutput := st.MsgOpened || len(st.FuncCallIDs) > 0
++		terminalType := "response.completed"
+ 		completed := []byte(`{"type":"response.completed","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null}}`)
++		if !hasActionableOutput {
++			terminalType = "response.failed"
++			completed = []byte(`{"type":"response.failed","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"failed","background":false,"error":{"type":"upstream_error","code":"empty_model_output","message":"Upstream model completed without a message or tool call. Please retry the turn."}}}`)
++		}
+ 		completed, _ = sjson.SetBytes(completed, "sequence_number", nextSeq())
+ 		completed, _ = sjson.SetBytes(completed, "response.id", st.ResponseID)
+ 		completed, _ = sjson.SetBytes(completed, "response.created_at", st.CreatedAt)
+@@ -617,7 +625,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
+ 			}
+ 		}
+ 
+-		out = append(out, emitEvent("response.completed", completed))
++		out = append(out, emitEvent(terminalType, completed))
+ 	}
+ 
+ 	return out
+@@ -728,6 +736,7 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
+ 	var reasoningEncrypted string
+ 	var messageText strings.Builder
+ 	var haveMessage bool
++	var haveFunctionCall bool
+ 
+ 	haveOutput := false
+ 	ensureOutput := func() {
+@@ -759,6 +768,7 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
+ 				return true
+ 			}
+ 			if fc := p.Get("functionCall"); fc.Exists() {
++				haveFunctionCall = true
+ 				qualifiedName := restoreOpenAIResponsesToolName(toolNameReverse, fc.Get("name").String())
+ 				tool, declared := openAIResponsesToolByQualifiedName(responseTools, qualifiedName)
+ 				if !declared {
+@@ -835,5 +845,12 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
+ 		}
+ 	}
+ 
++	if !haveMessage && !haveFunctionCall {
++		resp, _ = sjson.SetBytes(resp, "status", "failed")
++		resp, _ = sjson.SetBytes(resp, "error.type", "upstream_error")
++		resp, _ = sjson.SetBytes(resp, "error.code", "empty_model_output")
++		resp, _ = sjson.SetBytes(resp, "error.message", "Upstream model completed without a message or tool call. Please retry the turn.")
++	}
++
+ 	return resp
+ }
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_response_test.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_response_test.go
+index b0b10e83..f0159302 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_response_test.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_response_test.go
+@@ -487,3 +487,52 @@ func TestConvertGeminiResponseToOpenAIResponsesNonStream_RestoresCodexToolKinds(
+ 		t.Fatalf("output[1].call_id = %q, want call_send", got)
+ 	}
+ }
++
++func TestConvertGeminiResponseToOpenAIResponses_ReasoningOnlyFailsInsteadOfCompleting(t *testing.T) {
++	chunks := []string{
++		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"I inspected the command output."}]}}],"responseId":"reasoning_only"}}`,
++		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":95537,"thoughtsTokenCount":75,"totalTokenCount":95612},"responseId":"reasoning_only"}}`,
++	}
++
++	var param any
++	var output [][]byte
++	for _, chunk := range chunks {
++		output = append(output, ConvertGeminiResponseToOpenAIResponses(context.Background(), "test-model", nil, nil, []byte(chunk), &param)...)
++	}
++
++	var failed gjson.Result
++	for _, chunk := range output {
++		event, data := parseSSEEvent(t, chunk)
++		if event == "response.completed" {
++			t.Fatalf("reasoning-only output was silently completed: %s", chunk)
++		}
++		if event == "response.failed" {
++			failed = data
++		}
++	}
++	if !failed.Exists() {
++		t.Fatal("missing response.failed for reasoning-only terminal response")
++	}
++	if got := failed.Get("response.error.code").String(); got != "empty_model_output" {
++		t.Fatalf("error code = %q, want empty_model_output", got)
++	}
++	if got := failed.Get("response.status").String(); got != "failed" {
++		t.Fatalf("response status = %q, want failed", got)
++	}
++}
++
++func TestConvertGeminiResponseToOpenAIResponsesNonStream_ReasoningOnlyFails(t *testing.T) {
++	raw := []byte(`{"responseId":"reasoning_only_nonstream","candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"I inspected the command output."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":95537,"thoughtsTokenCount":75,"totalTokenCount":95612}}`)
++
++	response := ConvertGeminiResponseToOpenAIResponsesNonStream(context.Background(), "test-model", nil, nil, raw, nil)
++	result := gjson.ParseBytes(response)
++	if got := result.Get("status").String(); got != "failed" {
++		t.Fatalf("status = %q, want failed. Response: %s", got, response)
++	}
++	if got := result.Get("error.code").String(); got != "empty_model_output" {
++		t.Fatalf("error code = %q, want empty_model_output", got)
++	}
++	if got := result.Get("output.0.type").String(); got != "reasoning" {
++		t.Fatalf("reasoning output was not preserved: %s", response)
++	}
++}
+-- 
+2.55.0.windows.3
+

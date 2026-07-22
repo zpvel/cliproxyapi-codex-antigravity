@@ -1,0 +1,72 @@
+From 32d170f536e875cdc001f1731d345a062338ec92 Mon Sep 17 00:00:00 2001
+From: zpvel <56710676+zpvel@users.noreply.github.com>
+Date: Wed, 22 Jul 2026 19:49:04 +0800
+Subject: [PATCH] limit trailing reasoning cleanup to tool retries
+
+---
+ .../gemini_openai-responses_request.go        | 42 ++++++++++++++++---
+ 1 file changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+index f575d4a8..dfd0a5ff 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+@@ -365,8 +365,12 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
+ 				contentItems = append(contentItems, modelContent)
+ 			}
+ 		}
+-		if len(contentItems) > 0 && shouldStripTrailingOpenAIResponsesModelPrefill(gjson.ParseBytes(contentItems[len(contentItems)-1])) {
+-			contentItems = contentItems[:len(contentItems)-1]
++		if len(contentItems) > 0 {
++			lastContent := gjson.ParseBytes(contentItems[len(contentItems)-1])
++			if shouldStripTrailingOpenAIResponsesModelPrefill(lastContent) ||
++				shouldStripTrailingOpenAIResponsesReasoningAfterFunction(contentItems, lastContent) {
++				contentItems = contentItems[:len(contentItems)-1]
++			}
+ 		}
+ 		out = translatorcommon.SetRawArrayItems(out, "contents", contentItems)
+ 	} else if input.Exists() && input.Type == gjson.String {
+@@ -481,10 +485,36 @@ func geminiSystemInstruction(parts [][]byte) []byte {
+ }
+ 
+ func shouldStripTrailingOpenAIResponsesModelPrefill(lastContent gjson.Result) bool {
+-	// Cloud Code rejects every request ending in a model turn, including a
+-	// reasoning-only turn replayed by Codex after an empty-output failure.
+-	// Function responses use the separate "function" role and remain intact.
+-	return lastContent.Get("role").String() == "model"
++	if lastContent.Get("role").String() != "model" {
++		return false
++	}
++	parts := lastContent.Get("parts")
++	if !parts.IsArray() {
++		return false
++	}
++	for _, part := range parts.Array() {
++		if part.Get("thought").Bool() {
++			return false
++		}
++	}
++	return true
++}
++
++func shouldStripTrailingOpenAIResponsesReasoningAfterFunction(contentItems [][]byte, lastContent gjson.Result) bool {
++	if len(contentItems) < 2 || lastContent.Get("role").String() != "model" {
++		return false
++	}
++	parts := lastContent.Get("parts")
++	if !parts.IsArray() || len(parts.Array()) == 0 {
++		return false
++	}
++	for _, part := range parts.Array() {
++		if !part.Get("thought").Bool() && part.Get("text").String() != "" {
++			return false
++		}
++	}
++	previous := gjson.ParseBytes(contentItems[len(contentItems)-2])
++	return previous.Get("role").String() == "function" && previous.Get("parts.0.functionResponse").Exists()
+ }
+ 
+ func isTrailingOpenAIResponsesAssistantPrefill(items []gjson.Result, assistantIndex int) bool {
+-- 
+2.55.0.windows.3
+

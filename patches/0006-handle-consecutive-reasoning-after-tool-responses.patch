@@ -1,0 +1,142 @@
+From d7fbbc4794e6124014257abb32b6def4f16d9377 Mon Sep 17 00:00:00 2001
+From: zpvel <56710676+zpvel@users.noreply.github.com>
+Date: Wed, 22 Jul 2026 20:56:58 +0800
+Subject: [PATCH] handle consecutive reasoning after tool responses
+
+---
+ .../gemini_openai-responses_request.go        | 53 +++++++++++++++++--
+ .../gemini_openai-responses_request_test.go   | 44 +++++++++++++++
+ 2 files changed, 93 insertions(+), 4 deletions(-)
+
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+index dfd0a5f..e60e44e 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+@@ -367,11 +367,16 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
+ 		}
+ 		if len(contentItems) > 0 {
+ 			lastContent := gjson.ParseBytes(contentItems[len(contentItems)-1])
+-			if shouldStripTrailingOpenAIResponsesModelPrefill(lastContent) ||
+-				shouldStripTrailingOpenAIResponsesReasoningAfterFunction(contentItems, lastContent) {
++			if shouldStripTrailingOpenAIResponsesModelPrefill(lastContent) {
+ 				contentItems = contentItems[:len(contentItems)-1]
+ 			}
+ 		}
++		for len(contentItems) > 0 && shouldStripTrailingOpenAIResponsesReasoningAfterFunction(
++			contentItems,
++			gjson.ParseBytes(contentItems[len(contentItems)-1]),
++		) {
++			contentItems = contentItems[:len(contentItems)-1]
++		}
+ 		out = translatorcommon.SetRawArrayItems(out, "contents", contentItems)
+ 	} else if input.Exists() && input.Type == gjson.String {
+ 		// Simple string input conversion to user message.
+@@ -513,8 +518,48 @@ func shouldStripTrailingOpenAIResponsesReasoningAfterFunction(contentItems [][]b
+ 			return false
+ 		}
+ 	}
+-	previous := gjson.ParseBytes(contentItems[len(contentItems)-2])
+-	return previous.Get("role").String() == "function" && previous.Get("parts.0.functionResponse").Exists()
++	for i := len(contentItems) - 2; i >= 0; i-- {
++		previous := gjson.ParseBytes(contentItems[i])
++		if previous.Get("role").String() == "function" {
++			return openAIResponsesContentHasFunctionResponse(previous)
++		}
++		if !isOpenAIResponsesReasoningOnlyModelContent(previous) {
++			return false
++		}
++	}
++	return false
++}
++
++func openAIResponsesContentHasFunctionResponse(content gjson.Result) bool {
++	parts := content.Get("parts")
++	if !parts.IsArray() {
++		return false
++	}
++	for _, part := range parts.Array() {
++		if part.Get("functionResponse").Exists() {
++			return true
++		}
++	}
++	return false
++}
++
++func isOpenAIResponsesReasoningOnlyModelContent(content gjson.Result) bool {
++	if content.Get("role").String() != "model" {
++		return false
++	}
++	parts := content.Get("parts")
++	if !parts.IsArray() || len(parts.Array()) == 0 {
++		return false
++	}
++	for _, part := range parts.Array() {
++		if part.Get("functionCall").Exists() || part.Get("functionResponse").Exists() {
++			return false
++		}
++		if !part.Get("thought").Bool() && part.Get("text").String() != "" {
++			return false
++		}
++	}
++	return true
+ }
+ 
+ func isTrailingOpenAIResponsesAssistantPrefill(items []gjson.Result, assistantIndex int) bool {
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+index e049f13..2b84501 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+@@ -269,6 +269,50 @@ func TestConvertOpenAIResponsesRequestToGemini_StripsTrailingReasoningAfterFunct
+ 	}
+ }
+ 
++func TestConvertOpenAIResponsesRequestToGemini_StripsConsecutiveTrailingReasoningAfterFunctionResponse(t *testing.T) {
++	input := []byte(`{
++		"input":[
++			{"role":"user","content":[{"type":"input_text","text":"inspect files"}]},
++			{"type":"function_call","call_id":"call_shell","name":"shell_command","arguments":"{\"command\":\"Get-ChildItem\"}"},
++			{"type":"function_call_output","call_id":"call_shell","output":"command output"},
++			{"type":"reasoning","encrypted_content":"gemini#` + testResponsesGeminiThoughtSignature + `","summary":[{"type":"summary_text","text":"I inspected the output."}]},
++			{"type":"reasoning","encrypted_content":"gemini#` + testResponsesGeminiThoughtSignature + `","summary":[{"type":"summary_text","text":"I checked it again."}]}
++		]
++	}`)
++
++	output := ConvertOpenAIResponsesRequestToGemini("gemini-3.6-flash-high", input, true)
++	contents := gjson.GetBytes(output, "contents").Array()
++	if len(contents) != 3 {
++		t.Fatalf("contents length = %d, want 3 after dropping consecutive trailing reasoning. Output: %s", len(contents), output)
++	}
++	last := contents[len(contents)-1]
++	if got := last.Get("role").String(); got != "function" {
++		t.Fatalf("last role = %q, want function. Output: %s", got, output)
++	}
++	if !last.Get("parts.0.functionResponse").Exists() {
++		t.Fatalf("last part is not a function response. Output: %s", output)
++	}
++}
++
++func TestConvertOpenAIResponsesRequestToGemini_PreservesConsecutiveTrailingReasoningWithoutFunctionResponse(t *testing.T) {
++	input := []byte(`{
++		"input":[
++			{"role":"user","content":[{"type":"input_text","text":"continue"}]},
++			{"type":"reasoning","encrypted_content":"gemini#` + testResponsesGeminiThoughtSignature + `","summary":[{"type":"summary_text","text":"first thought"}]},
++			{"type":"reasoning","encrypted_content":"gemini#` + testResponsesGeminiThoughtSignature + `","summary":[{"type":"summary_text","text":"second thought"}]}
++		]
++	}`)
++
++	output := ConvertOpenAIResponsesRequestToGemini("gemini-3.6-flash-high", input, true)
++	contents := gjson.GetBytes(output, "contents").Array()
++	if len(contents) != 3 {
++		t.Fatalf("contents length = %d, want 3 when no function response precedes reasoning. Output: %s", len(contents), output)
++	}
++	if got := contents[len(contents)-1].Get("role").String(); got != "model" {
++		t.Fatalf("last role = %q, want preserved model reasoning. Output: %s", got, output)
++	}
++}
++
+ func TestConvertOpenAIResponsesRequestToGemini_MergesReasoningWithAssistantVisibleAnswer(t *testing.T) {
+ 	inputJSON := `{
+ 		"model": "gemini-3.5-flash",
+-- 
+2.55.0.windows.3
+

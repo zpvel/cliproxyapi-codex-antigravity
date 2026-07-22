@@ -11,6 +11,7 @@ The patch adds end-to-end support for:
 - streaming and non-streaming tool-call events;
 - upstream function-call IDs as Responses `call_id` values;
 - explicit `response.failed` events when an upstream model stops after reasoning without producing a message or tool call;
+- recovery of consecutive trailing reasoning-only items after a completed tool response, keeping Cloud Code requests function-response terminated;
 - existing Gemini and Claude reasoning-signature behavior.
 
 ## Images

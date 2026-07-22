@@ -1,0 +1,96 @@
+From b692beedd5c87b6745f049954f43ae66793512c4 Mon Sep 17 00:00:00 2001
+From: zpvel <56710676+zpvel@users.noreply.github.com>
+Date: Wed, 22 Jul 2026 19:34:56 +0800
+Subject: [PATCH] strip trailing reasoning from antigravity retries
+
+---
+ .../gemini_openai-responses_request.go        | 17 ++-------
+ .../gemini_openai-responses_request_test.go   | 37 ++++++++++++++++---
+ 2 files changed, 36 insertions(+), 18 deletions(-)
+
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+index 890fdc1a..f575d4a8 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request.go
+@@ -481,19 +481,10 @@ func geminiSystemInstruction(parts [][]byte) []byte {
+ }
+ 
+ func shouldStripTrailingOpenAIResponsesModelPrefill(lastContent gjson.Result) bool {
+-	if lastContent.Get("role").String() != "model" {
+-		return false
+-	}
+-	parts := lastContent.Get("parts")
+-	if !parts.IsArray() {
+-		return false
+-	}
+-	for _, part := range parts.Array() {
+-		if part.Get("thought").Bool() {
+-			return false
+-		}
+-	}
+-	return true
++	// Cloud Code rejects every request ending in a model turn, including a
++	// reasoning-only turn replayed by Codex after an empty-output failure.
++	// Function responses use the separate "function" role and remain intact.
++	return lastContent.Get("role").String() == "model"
+ }
+ 
+ func isTrailingOpenAIResponsesAssistantPrefill(items []gjson.Result, assistantIndex int) bool {
+diff --git a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+index 83c5a72c..e049f137 100644
+--- a/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
++++ b/internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go
+@@ -220,11 +220,14 @@ func TestConvertOpenAIResponsesRequestToGemini_ReasoningSignatureCompatibility(t
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			input := []byte(`{
+ 				"model": "gpt-5",
+-				"input": [{
+-					"type": "reasoning",
+-					"encrypted_content": "` + tt.encrypted + `",
+-					"summary": [{"type": "summary_text", "text": "reasoning summary"}]
+-				}]
++				"input": [
++					{
++						"type": "reasoning",
++						"encrypted_content": "` + tt.encrypted + `",
++						"summary": [{"type": "summary_text", "text": "reasoning summary"}]
++					},
++					{"role":"user","content":[{"type":"input_text","text":"continue"}]}
++				]
+ 			}`)
+ 
+ 			output := ConvertOpenAIResponsesRequestToGemini("gemini-3.5-flash", input, false)
+@@ -242,6 +245,30 @@ func TestConvertOpenAIResponsesRequestToGemini_ReasoningSignatureCompatibility(t
+ 	}
+ }
+ 
++func TestConvertOpenAIResponsesRequestToGemini_StripsTrailingReasoningAfterFunctionResponse(t *testing.T) {
++	input := []byte(`{
++		"input":[
++			{"role":"user","content":[{"type":"input_text","text":"inspect files"}]},
++			{"type":"function_call","call_id":"call_shell","name":"shell_command","arguments":"{\"command\":\"Get-ChildItem\"}"},
++			{"type":"function_call_output","call_id":"call_shell","output":"command output"},
++			{"type":"reasoning","encrypted_content":"gemini#` + testResponsesGeminiThoughtSignature + `","summary":[{"type":"summary_text","text":"I inspected the output."}]}
++		]
++	}`)
++
++	output := ConvertOpenAIResponsesRequestToGemini("gemini-3.6-flash-high", input, true)
++	contents := gjson.GetBytes(output, "contents").Array()
++	if len(contents) != 3 {
++		t.Fatalf("contents length = %d, want 3 after dropping trailing reasoning. Output: %s", len(contents), output)
++	}
++	last := contents[len(contents)-1]
++	if got := last.Get("role").String(); got != "function" {
++		t.Fatalf("last role = %q, want function. Output: %s", got, output)
++	}
++	if !last.Get("parts.0.functionResponse").Exists() {
++		t.Fatalf("last part is not a function response. Output: %s", output)
++	}
++}
++
+ func TestConvertOpenAIResponsesRequestToGemini_MergesReasoningWithAssistantVisibleAnswer(t *testing.T) {
+ 	inputJSON := `{
+ 		"model": "gemini-3.5-flash",
+-- 
+2.55.0.windows.3
+

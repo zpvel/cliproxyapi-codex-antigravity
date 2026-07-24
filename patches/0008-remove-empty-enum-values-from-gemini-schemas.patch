@@ -1,0 +1,102 @@
+From 43026ea68ba70130f7ac821a5f2a9986686a430a Mon Sep 17 00:00:00 2001
+From: zpvel <56710676+zpvel@users.noreply.github.com>
+Date: Fri, 24 Jul 2026 14:51:37 +0800
+Subject: [PATCH] remove empty enum values from Gemini schemas
+
+---
+ internal/util/gemini_schema.go      | 31 +++++++++++++++++++++++++++++
+ internal/util/gemini_schema_test.go | 30 ++++++++++++++++++++++++++++
+ 2 files changed, 61 insertions(+)
+
+diff --git a/internal/util/gemini_schema.go b/internal/util/gemini_schema.go
+index 010669a..c09e55b 100644
+--- a/internal/util/gemini_schema.go
++++ b/internal/util/gemini_schema.go
+@@ -49,6 +49,7 @@ func cleanJSONSchema(jsonStr string, addPlaceholder bool) string {
+ 		// Gemini schema cleanup: remove nullable/title and placeholder-only fields.
+ 		jsonStr = removeKeywords(jsonStr, []string{"nullable", "title"})
+ 		jsonStr = removePlaceholderFields(jsonStr)
++		jsonStr = removeEmptyEnumValues(jsonStr)
+ 	}
+ 	jsonStr = cleanupRequiredFields(jsonStr)
+ 	// Phase 4: Add placeholder for empty object schemas (Claude VALIDATED mode requirement)
+@@ -211,6 +212,36 @@ func convertEnumValuesToStrings(jsonStr string) string {
+ 	return jsonStr
+ }
+ 
++// removeEmptyEnumValues removes enum members rejected by the Gemini API. Some
++// Codex tool schemas use an empty string as a UI sentinel, but Gemini requires
++// every enum value to be non-empty.
++func removeEmptyEnumValues(jsonStr string) string {
++	paths := findPaths(jsonStr, "enum")
++	sortByDepth(paths)
++	for _, p := range paths {
++		enum := gjson.Get(jsonStr, p)
++		if !enum.IsArray() {
++			continue
++		}
++
++		values := make([]string, 0, len(enum.Array()))
++		for _, value := range enum.Array() {
++			if value.String() != "" {
++				values = append(values, value.String())
++			}
++		}
++		if len(values) == 0 {
++			jsonStr, _ = sjson.Delete(jsonStr, p)
++			continue
++		}
++		if len(values) != len(enum.Array()) {
++			updated, _ := sjson.SetBytes([]byte(jsonStr), p, values)
++			jsonStr = string(updated)
++		}
++	}
++	return jsonStr
++}
++
+ func addEnumHints(jsonStr string) string {
+ 	for _, p := range findPaths(jsonStr, "enum") {
+ 		arr := gjson.Get(jsonStr, p)
+diff --git a/internal/util/gemini_schema_test.go b/internal/util/gemini_schema_test.go
+index bb581cd..237d7cf 100644
+--- a/internal/util/gemini_schema_test.go
++++ b/internal/util/gemini_schema_test.go
+@@ -940,6 +940,36 @@ func TestCleanJSONSchemaForGemini_RemovesGeminiUnsupportedMetadataFields(t *test
+ 	compareJSON(t, expected, result)
+ }
+ 
++func TestCleanJSONSchemaForGemini_RemovesEmptyEnumValuesRecursively(t *testing.T) {
++	input := `{
++		"type": "object",
++		"properties": {
++			"status": {"type": "string", "enum": ["ready", "", "failed"]},
++			"empty_only": {"type": "string", "enum": [""]},
++			"rows": {
++				"type": "array",
++				"items": {
++					"type": "object",
++					"properties": {
++						"align": {"type": "string", "enum": ["left", "", "right"]}
++					}
++				}
++			}
++		}
++	}`
++
++	result := CleanJSONSchemaForGemini(input)
++	if got := gjson.Get(result, "properties.status.enum").Array(); len(got) != 2 || got[0].String() != "ready" || got[1].String() != "failed" {
++		t.Fatalf("status enum = %s, want ready/failed", gjson.Get(result, "properties.status.enum").Raw)
++	}
++	if gjson.Get(result, "properties.empty_only.enum").Exists() {
++		t.Fatalf("empty-only enum should be removed: %s", result)
++	}
++	if got := gjson.Get(result, "properties.rows.items.properties.align.enum").Array(); len(got) != 2 || got[0].String() != "left" || got[1].String() != "right" {
++		t.Fatalf("nested enum = %s, want left/right", gjson.Get(result, "properties.rows.items.properties.align.enum").Raw)
++	}
++}
++
+ func TestRemoveExtensionFields(t *testing.T) {
+ 	tests := []struct {
+ 		name     string
+-- 
+2.55.0.windows.3

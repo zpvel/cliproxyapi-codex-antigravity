@@ -13,6 +13,7 @@ The patch adds end-to-end support for:
 - explicit `response.failed` events when an upstream model stops after reasoning without producing a message or tool call;
 - recovery of consecutive trailing reasoning-only items after a completed tool response, keeping Cloud Code requests function-response terminated;
 - management model probes inherit the matching Codex provider's proxy setting even when the UI omits `auth_index`, so direct LAN upstreams do not fall back to the global proxy;
+- empty-string enum sentinels are removed from Gemini tool schemas, which otherwise rejects the entire GenerateContent request;
 - existing Gemini and Claude reasoning-signature behavior.
 
 ## Images
